@@ -31,7 +31,6 @@ const MODEL_NAME = 'gpt-4o';
 const META_MODEL_NAME = 'gpt-4o-mini';
 const DEFAULT_CONTEXT_WINDOW = 128 * 1024;
 const MIN_RESERVE_TOKENS = 4 * 1024;
-const MAX_RESERVE_TOKENS = 32 * 1024;
 const DEFAULT_TOOL_TIMEOUT_MS = 20_000;
 const MAX_TOOL_TIMEOUT_MS = 120_000;
 const TOOL_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
@@ -153,7 +152,8 @@ const estimateTokenCount = (text: string) => Math.max(1, Math.ceil(text.length /
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
 function buildRuntimeModelConfig(contextWindow: number, source: 'api' | 'fallback'): RuntimeModelConfig {
-    const reserveTokens = clamp(Math.round(contextWindow * 0.15), MIN_RESERVE_TOKENS, MAX_RESERVE_TOKENS);
+    const maxReserveTokens = Math.max(MIN_RESERVE_TOKENS, Math.floor(contextWindow / 2));
+    const reserveTokens = clamp(Math.round(contextWindow * 0.15), MIN_RESERVE_TOKENS, maxReserveTokens);
     const compressionThreshold = Math.max(MIN_RESERVE_TOKENS, contextWindow - reserveTokens);
     const forkHistoryTargetTokens = clamp(
         Math.round(contextWindow * 0.25),
@@ -253,26 +253,26 @@ async function getRuntimeModelConfig(): Promise<RuntimeModelConfig> {
 }
 
 function buildAgentSystemPrompt(renderedContext: string, runtimeConfig: RuntimeModelConfig): string {
-    return `你是 Stories 里的仓库内编码 Agent，负责在 ${REPO_ROOT} 中继续当前任务。
+    return `You are the coding agent running inside Stories. Continue the current task from ${REPO_ROOT}.
 
-工作方式（参考现代 coding agent / pi 风格）：
-1. 先理解目标，再检查仓库，再修改，再验证。
-2. CURRENT CONTEXT 是你的主要状态；若信息不足，优先用工具补齐事实，不要猜测。
-3. 工具调用要有目的：尽量一次完成一组相关检查，避免无意义的重复调用。
-4. 修改前先查看目标文件或确认已有上下文；修改后运行最小必要验证。
-5. 回复简洁，重点给出结论、下一步或工具调用结果，不要重复大段上下文。
+Operating rules:
+1. Understand the goal first, then inspect the repository, then make changes, then validate them.
+2. Treat CURRENT CONTEXT as your primary state. If information is missing, use tools to gather facts instead of guessing.
+3. Make purposeful tool calls. Batch related inspection steps when possible and avoid redundant commands.
+4. Read the target files before editing. After editing, run the smallest validation that proves the change works.
+5. Keep responses concise and action-oriented. Focus on conclusions, next steps, and tool outcomes.
 
-bash 工具约定：
-- 默认工作目录是 ${REPO_ROOT}
-- 搜索优先使用 rg、ls、find、sed -n、cat
-- 编辑时优先使用可重复的命令或小脚本，避免高风险破坏性命令
-- 如果工具输出被截断，应改用更聚焦的命令重新查看
+Bash tool guidance:
+- The default working directory is ${REPO_ROOT}
+- Prefer rg, ls, find, sed -n, and cat for repository inspection
+- Prefer reproducible commands or small scripts for edits and avoid destructive commands
+- If command output is truncated, rerun a narrower command instead of repeating the same broad command
 
-当前运行时预算：
-- 主模型: ${MODEL_NAME}
-- 最大上下文: ~${runtimeConfig.contextWindow} tokens (${runtimeConfig.source === 'api' ? 'API discovery' : '128K fallback'})
-- 启发式压缩阈值: ~${runtimeConfig.compressionThreshold} tokens
-- 预留缓冲: ~${runtimeConfig.reserveTokens} tokens
+Runtime budget:
+- Primary model: ${MODEL_NAME}
+- Maximum context: ~${runtimeConfig.contextWindow} tokens (${runtimeConfig.source === 'api' ? 'API discovery' : '128K fallback'})
+- Heuristic compression threshold: ~${runtimeConfig.compressionThreshold} tokens
+- Reserved buffer: ~${runtimeConfig.reserveTokens} tokens
 
 ========== CURRENT CONTEXT ==========
 ${renderedContext}
@@ -280,19 +280,19 @@ ${renderedContext}
 }
 
 function buildCompressionSystemPrompt(runtimeConfig: RuntimeModelConfig): string {
-    return `你是负责上下文压缩的 Meta-Agent，目标是在不丢失当前任务连续性的前提下，为主 Agent 回收上下文空间。
+    return `You are the meta-agent responsible for context compression. Recover context budget for the main agent without breaking task continuity.
 
-压缩策略（参考 badlogic/pi-mono 中 pi coding agent 的 compaction 思路）：
-1. 优先折叠旧的 assistant/tool 长输出。
-2. 只有在折叠不足时，才 recycle 最老的一段可见 Scene。
-3. 不要动最新的用户请求、最新的 assistant 响应、以及最新的重要工具结果，除非别无选择。
-4. 动作越少越好，但要把上下文压到阈值以下。
-5. 只返回符合 schema 的动作，不要输出额外文本。
+Compression policy:
+1. Prefer collapsing older verbose assistant or tool output first.
+2. Recycle the oldest visible scenes only when collapsing is not enough.
+3. Preserve the latest user request, the latest assistant reply, and the most important recent tool results unless there is no alternative.
+4. Use as few actions as possible, but ensure the remaining context falls below the threshold.
+5. Return schema-compliant actions only. Do not add extra prose.
 
-当前预算：
-- 最大上下文: ${runtimeConfig.contextWindow} tokens
-- 压缩阈值: ${runtimeConfig.compressionThreshold} tokens
-- 预留缓冲: ${runtimeConfig.reserveTokens} tokens`;
+Current budget:
+- Maximum context: ${runtimeConfig.contextWindow} tokens
+- Compression threshold: ${runtimeConfig.compressionThreshold} tokens
+- Reserved buffer: ${runtimeConfig.reserveTokens} tokens`;
 }
 
 function resolveToolCwd(cwd?: string): string {
@@ -396,7 +396,7 @@ async function runMetaCompression(storyId: string, runtimeConfig?: RuntimeModelC
     const { output } = await generateText({
         model: openai(META_MODEL_NAME),
         system: buildCompressionSystemPrompt(runtime),
-        prompt: `当前窗口快照:\n${JSON.stringify({
+        prompt: `Current window snapshot:\n${JSON.stringify({
             currentPromptTokens,
             compressionThreshold: runtime.compressionThreshold,
             reserveTokens: runtime.reserveTokens,
@@ -539,10 +539,10 @@ app.post('/api/chat', async (req: Request, res: Response) => {
         const { text, steps } = await generateText({
             model: openai(MODEL_NAME),
             system: systemPrompt,
-            prompt: "请基于最新 Context 继续完成任务；需要时直接调用工具，不要空转。",
+            prompt: 'Continue the task using the latest context. Call tools when needed and avoid idle filler.',
             tools: {
                 bash: tool({
-                    description: `在仓库内执行 bash 命令。默认 cwd=${REPO_ROOT}，支持可选 cwd 和 timeoutMs，输出可能被截断。`,
+                    description: `Execute a bash command inside the repository. Default cwd=${REPO_ROOT}; optional cwd and timeoutMs are supported; output may be truncated.`,
                     inputSchema: z.object({
                         command: z.string(),
                         cwd: z.string().optional(),
