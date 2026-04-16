@@ -13,7 +13,7 @@ A Context Engineering Agent Demo - A visual interface for managing AI agent conv
 - **Visual Context Management**: Track and visualize agent conversation nodes in real-time
 - **Story Branching**: Create and switch between different conversation branches
 - **Context Window**: Automatic context eviction with token-aware windowing
-- **Meta-Agent Compression**: AI-powered context compression to prevent context overflow
+- **Meta-Agent Compression**: AI-powered context compression with heuristic thresholding to prevent context overflow
 - **Fork & Merge**: Branch from any historical point in the conversation
 
 ## Getting Started
@@ -46,6 +46,8 @@ cp .env.example .env
 Required environment variables:
 - `STORIES_API_BASE_URL` - LLM API base URL (e.g., `https://api.openai.com/v1`)
 - `STORIES_API_KEY` - Your API key
+
+The backend will try to discover the model's maximum context size from the provider API. If the provider does not expose it, the server falls back to a 128K-token window and derives compression/fork budgets heuristically from that value.
 
 The server will refuse to start if these variables are not set.
 
