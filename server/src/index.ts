@@ -6,7 +6,7 @@ import { promisify } from 'util';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { generateText, Output, tool, stepCountIs } from 'ai';
-import { createOpenAI } from '@ai-sdk/openai';
+import { createAnthropic } from '@ai-sdk/anthropic';
 import { z } from 'zod';
 import dotenv from 'dotenv';
 import type { Request, Response } from 'express';
@@ -18,17 +18,18 @@ const execAsync = promisify(exec);
 // ==========================================
 // Configuration (Environment Variables)
 // ==========================================
-const BASE_URL = process.env.STORIES_API_BASE_URL;
+const RAW_BASE_URL = process.env.STORIES_API_BASE_URL;
 const API_KEY = process.env.STORIES_API_KEY;
 
-if (!BASE_URL || !API_KEY) {
+if (!RAW_BASE_URL || !API_KEY) {
   console.error('Error: Missing required environment variables');
   console.error('Please set STORIES_API_BASE_URL and STORIES_API_KEY');
   process.exit(1);
 }
 
-const MODEL_NAME = 'gpt-4o';
-const META_MODEL_NAME = 'gpt-4o-mini';
+const PROVIDER_NAME = process.env.STORIES_PROVIDER_NAME || 'unknown-provider';
+const MODEL_NAME = process.env.STORIES_MODEL_NAME || 'gpt-4o';
+const META_MODEL_NAME = process.env.STORIES_META_MODEL_NAME || MODEL_NAME;
 const DEFAULT_CONTEXT_WINDOW = 128 * 1024;
 const MIN_RESERVE_TOKENS = 4 * 1024;
 const DEFAULT_TOOL_TIMEOUT_MS = 20_000;
@@ -37,8 +38,35 @@ const TOOL_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
 const MAX_AUTO_COMPRESSION_PASSES = 2;
 const serverDir = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(serverDir, '..', '..');
+const KNOWN_CONTEXT_WINDOWS: Record<string, number> = {
+    'MiniMax-M2.7': 204_800,
+    'MiniMax-M2.7-highspeed': 204_800,
+    'MiniMax-M2.5': 204_800,
+    'MiniMax-M2.5-highspeed': 204_800,
+    'MiniMax-M2.1': 204_800,
+    'MiniMax-M2.1-highspeed': 204_800,
+    'MiniMax-M2': 204_800,
+};
 
-const openai = createOpenAI({ baseURL: BASE_URL, apiKey: API_KEY });
+function normalizeAnthropicBaseUrl(baseUrl: string): string {
+    const trimmed = baseUrl.replace(/\/+$/, '');
+
+    // MiniMax docs target the official Anthropic SDK, whose base URL omits `/v1`.
+    // The Vercel AI SDK Anthropic provider appends `/messages` itself, so it needs `/v1` included.
+    if (/^https:\/\/api\.minimaxi\.com\/anthropic$/i.test(trimmed)) {
+        return `${trimmed}/v1`;
+    }
+
+    return trimmed;
+}
+
+const BASE_URL = normalizeAnthropicBaseUrl(RAW_BASE_URL);
+
+const provider = createAnthropic({
+    baseURL: BASE_URL,
+    apiKey: API_KEY,
+    name: PROVIDER_NAME,
+});
 
 // ==========================================
 // 1. 核心架构定义 (基于 V5)
@@ -65,7 +93,7 @@ interface RuntimeModelConfig {
     reserveTokens: number;
     compressionThreshold: number;
     forkHistoryTargetTokens: number;
-    source: 'api' | 'fallback';
+    source: 'api' | 'docs' | 'fallback';
 }
 
 interface CompressionAction {
@@ -151,7 +179,7 @@ const generateHash = (text: string) => crypto.createHash('md5').update(text + Ma
 const estimateTokenCount = (text: string) => Math.max(1, Math.ceil(text.length / 4));
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
-function buildRuntimeModelConfig(contextWindow: number, source: 'api' | 'fallback'): RuntimeModelConfig {
+function buildRuntimeModelConfig(contextWindow: number, source: 'api' | 'docs' | 'fallback'): RuntimeModelConfig {
     const maxReserveTokens = Math.max(MIN_RESERVE_TOKENS, Math.floor(contextWindow / 2));
     const reserveTokens = clamp(Math.round(contextWindow * 0.15), MIN_RESERVE_TOKENS, maxReserveTokens);
     const compressionThreshold = Math.max(MIN_RESERVE_TOKENS, contextWindow - reserveTokens);
@@ -214,6 +242,11 @@ function extractContextWindow(candidate: unknown, depth = 0): number | undefined
 }
 
 async function discoverModelContextWindow(): Promise<RuntimeModelConfig> {
+    const documentedContextWindow = KNOWN_CONTEXT_WINDOWS[MODEL_NAME];
+    if (documentedContextWindow) {
+        return buildRuntimeModelConfig(documentedContextWindow, 'docs');
+    }
+
     try {
         const response = await fetch(getModelsEndpoint(BASE_URL), {
             headers: {
@@ -270,7 +303,7 @@ Bash tool guidance:
 
 Runtime budget:
 - Primary model: ${MODEL_NAME}
-- Maximum context: ~${runtimeConfig.contextWindow} tokens (${runtimeConfig.source === 'api' ? 'API discovery' : '128K fallback'})
+- Maximum context: ~${runtimeConfig.contextWindow} tokens (${runtimeConfig.source === 'api' ? 'API discovery' : runtimeConfig.source === 'docs' ? 'provider docs' : '128K fallback'})
 - Heuristic compression threshold: ~${runtimeConfig.compressionThreshold} tokens
 - Reserved buffer: ~${runtimeConfig.reserveTokens} tokens
 
@@ -394,7 +427,7 @@ async function runMetaCompression(storyId: string, runtimeConfig?: RuntimeModelC
     const currentPromptTokens = estimateTokenCount(buildAgentSystemPrompt(storyWindow.render(graph), runtime));
 
     const { output } = await generateText({
-        model: openai(META_MODEL_NAME),
+        model: provider(META_MODEL_NAME),
         system: buildCompressionSystemPrompt(runtime),
         prompt: `Current window snapshot:\n${JSON.stringify({
             currentPromptTokens,
@@ -537,7 +570,7 @@ app.post('/api/chat', async (req: Request, res: Response) => {
         }
 
         const { text, steps } = await generateText({
-            model: openai(MODEL_NAME),
+            model: provider(MODEL_NAME),
             system: systemPrompt,
             prompt: 'Continue the task using the latest context. Call tools when needed and avoid idle filler.',
             tools: {

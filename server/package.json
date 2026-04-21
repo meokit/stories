@@ -9,7 +9,8 @@
     "start:prod": "node dist/index.js"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^3.0.52",
+    "@ai-sdk/anthropic": "^3.0.71",
+    "@ai-sdk/openai-compatible": "^2.0.41",
     "ai": "^6.0.159",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
