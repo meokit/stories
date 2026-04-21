@@ -287,69 +287,126 @@ function getToolStatus(toolName, resultPayload, hasResult, isStreaming) {
   return 'success';
 }
 
-function buildRenderEntries(scenes) {
-  const entries = [];
-  for (let index = 0; index < scenes.length; index++) {
-    const scene = scenes[index];
-    const event = getToolEventFromScene(scene);
+function isCompressedToolResultScene(scene) {
+  return scene?.mode === 'COLLAPSED' && scene?.protocol?.kind === 'assistant-tool-result' && !scene?.isEvicted;
+}
 
-    if (!event || event.phase !== 'call') {
-      if (event?.phase === 'result') {
-        entries.push({
-          kind: 'tool-group',
-          id: `tool-${event.toolCallId}-${scene.id}`,
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          status: getToolStatus(event.toolName, event.payload, true, event.isStreaming),
-          summary: buildToolSummary(event.toolName, null, event.payload, true),
-          callScene: null,
-          resultScene: event.scene,
-          callPayload: null,
-          resultPayload: event.payload,
-          scenes: [scene],
-          isStreaming: event.isStreaming,
-          compressibleSceneId: !scene.transient && !scene.isEvicted ? scene.id : null,
-        });
-      } else {
+function shouldPreferToolScene(nextScene, currentScene) {
+  if (!currentScene) return true;
+  const nextRank = nextScene?.transient ? 0 : 1;
+  const currentRank = currentScene?.transient ? 0 : 1;
+  if (nextRank !== currentRank) return nextRank > currentRank;
+  return false;
+}
+
+function collectToolGroups(scenes) {
+  const groups = new Map();
+
+  scenes.forEach((scene, index) => {
+    if (isCompressedToolResultScene(scene)) {
+      const toolCallId = scene.protocol.toolCallId;
+      const existing = groups.get(toolCallId) || { toolCallId };
+      if (shouldPreferToolScene(scene, existing.compressedResultScene)) {
+        existing.compressedResultScene = scene;
+        existing.compressedResultIndex = index;
+        existing.toolName = scene.protocol.toolName;
+      }
+      groups.set(toolCallId, existing);
+      return;
+    }
+
+    const event = getToolEventFromScene(scene);
+    if (!event) return;
+
+    const existing = groups.get(event.toolCallId) || { toolCallId: event.toolCallId };
+    existing.toolName = existing.toolName || event.toolName;
+
+    if (event.phase === 'call') {
+      if (shouldPreferToolScene(scene, existing.callScene)) {
+        existing.callScene = scene;
+        existing.callPayload = event.payload;
+        existing.callIndex = index;
+      }
+    } else if (shouldPreferToolScene(scene, existing.resultScene)) {
+      existing.resultScene = scene;
+      existing.resultPayload = event.payload;
+      existing.resultIndex = index;
+    }
+
+    groups.set(event.toolCallId, existing);
+  });
+
+  return groups;
+}
+
+function buildRenderEntries(scenes) {
+  const toolGroups = collectToolGroups(scenes);
+  const entries = [];
+  const emittedToolGroupIds = new Set();
+
+  for (let index = 0; index < scenes.length; index += 1) {
+    const scene = scenes[index];
+    if (scene.type === 'sentinel') continue;
+
+    if (isCompressedToolResultScene(scene)) {
+      const toolGroup = toolGroups.get(scene.protocol.toolCallId);
+      if (
+        toolGroup?.compressedResultScene?.id === scene.id
+        && !emittedToolGroupIds.has(scene.protocol.toolCallId)
+      ) {
         entries.push({ kind: 'scene', scene });
+        emittedToolGroupIds.add(scene.protocol.toolCallId);
       }
       continue;
     }
 
-    const nextScene = scenes[index + 1];
-    const pairedCompressedResult = nextScene
-      && nextScene.mode === 'COLLAPSED'
-      && nextScene.protocol?.kind === 'assistant-tool-result'
-      && nextScene.protocol.toolCallId === event.toolCallId;
+    const event = getToolEventFromScene(scene);
 
-    if (pairedCompressedResult) {
-      entries.push({ kind: 'scene', scene: nextScene });
-      index += 1;
+    if (!event) {
+      entries.push({ kind: 'scene', scene });
       continue;
     }
 
-    const nextEvent = nextScene ? getToolEventFromScene(nextScene) : null;
-    const matchedResult = nextEvent?.phase === 'result' && nextEvent.toolCallId === event.toolCallId ? nextEvent : null;
+    if (emittedToolGroupIds.has(event.toolCallId)) {
+      continue;
+    }
+
+    const toolGroup = toolGroups.get(event.toolCallId);
+    if (!toolGroup) {
+      entries.push({ kind: 'scene', scene });
+      continue;
+    }
+
+    if (toolGroup.compressedResultScene) {
+      continue;
+    }
+
+    const anchorScene = toolGroup.callScene || toolGroup.resultScene;
+    if (!anchorScene || anchorScene.id !== scene.id) {
+      continue;
+    }
+
+    const isStreaming = !!(toolGroup.callScene?.transient || toolGroup.resultScene?.transient);
+    const hasResult = !!toolGroup.resultScene;
 
     entries.push({
       kind: 'tool-group',
-      id: `tool-${event.toolCallId}-${scene.id}`,
+      id: `tool-${event.toolCallId}`,
       toolCallId: event.toolCallId,
-      toolName: event.toolName,
-      status: getToolStatus(event.toolName, matchedResult?.payload, !!matchedResult, event.isStreaming || matchedResult?.isStreaming),
-      summary: buildToolSummary(event.toolName, event.payload, matchedResult?.payload, !!matchedResult),
-      callScene: event.scene,
-      resultScene: matchedResult?.scene || null,
-      callPayload: event.payload,
-      resultPayload: matchedResult?.payload,
-      scenes: matchedResult ? [scene, nextScene] : [scene],
-      isStreaming: event.isStreaming || matchedResult?.isStreaming,
-      compressibleSceneId: matchedResult?.scene && !matchedResult.scene.transient && !matchedResult.scene.isEvicted
-        ? matchedResult.scene.id
-        : (!event.scene.transient && !event.scene.isEvicted ? event.scene.id : null),
+      toolName: toolGroup.toolName || event.toolName,
+      status: getToolStatus(toolGroup.toolName || event.toolName, toolGroup.resultPayload, hasResult, isStreaming),
+      summary: buildToolSummary(toolGroup.toolName || event.toolName, toolGroup.callPayload, toolGroup.resultPayload, hasResult),
+      callScene: toolGroup.callScene || null,
+      resultScene: toolGroup.resultScene || null,
+      callPayload: toolGroup.callPayload ?? null,
+      resultPayload: toolGroup.resultPayload,
+      scenes: [toolGroup.callScene, toolGroup.resultScene].filter(Boolean),
+      isStreaming,
+      compressibleSceneId: toolGroup.resultScene && !toolGroup.resultScene.transient && !toolGroup.resultScene.isEvicted
+        ? toolGroup.resultScene.id
+        : (toolGroup.callScene && !toolGroup.callScene.transient && !toolGroup.callScene.isEvicted ? toolGroup.callScene.id : null),
     });
-
-    if (matchedResult) index += 1;
+    emittedToolGroupIds.add(event.toolCallId);
   }
   return entries;
 }
@@ -360,13 +417,13 @@ const JsonNode = ({ value, name, depth = 0 }) => {
   const isArray = Array.isArray(value);
 
   if (!isObj) {
-    let color = 'text-green-400';
-    if (typeof value === 'number') color = 'text-blue-400';
-    if (typeof value === 'boolean') color = 'text-purple-400';
-    if (value === null) color = 'text-gray-500';
+    let color = 'text-[#fa520f]';
+    if (typeof value === 'number') color = 'text-[#fb6424]';
+    if (typeof value === 'boolean') color = 'text-[#ff8105]';
+    if (value === null) color = 'text-[#1f1f1f]';
     return (
       <div className="flex gap-2 min-w-0">
-        {name && <span className="text-gray-300 flex-shrink-0">{name}:</span>}
+        {name && <span className="text-[#1f1f1f] flex-shrink-0 opacity-60">{name}:</span>}
         <span className={`${color} break-words break-all`}>{String(value)}</span>
       </div>
     );
@@ -377,18 +434,18 @@ const JsonNode = ({ value, name, depth = 0 }) => {
 
   return (
     <div className="font-mono text-xs min-w-0">
-      <div className={`flex items-center gap-1 ${isEmpty ? '' : 'cursor-pointer hover:bg-white/5'} py-0.5 px-1 rounded -ml-1`} onClick={() => !isEmpty && setExpanded(!expanded)}>
-        {name && <span className="text-gray-300 flex-shrink-0">{name}:</span>}
-        <span className="text-gray-500">
+      <div className={`flex items-center gap-1 ${isEmpty ? '' : 'cursor-pointer hover:bg-[#fff0c2]'} py-0.5 px-1 -ml-1`} onClick={() => !isEmpty && setExpanded(!expanded)}>
+        {name && <span className="text-[#1f1f1f] flex-shrink-0 opacity-60">{name}:</span>}
+        <span className="text-[#1f1f1f] opacity-40">
           {isArray ? '[' : '{'}
           {!expanded && !isEmpty && ` ...${keys.length} items `}
           {(!expanded || isEmpty) && (isArray ? ']' : '}')}
         </span>
       </div>
       {expanded && !isEmpty && (
-        <div className="pl-4 border-l border-gray-700/50 mt-0.5">
+        <div className="pl-4 border-l border-[#ffa110] mt-0.5">
           {keys.map((key) => <JsonNode key={key} name={isArray ? null : key} value={value[key]} depth={depth + 1} />)}
-          <div className="text-gray-500 -ml-1 mt-0.5">{isArray ? ']' : '}'}</div>
+          <div className="text-[#1f1f1f] opacity-40 -ml-1 mt-0.5">{isArray ? ']' : '}'}</div>
         </div>
       )}
     </div>
@@ -572,43 +629,43 @@ const SceneCard = ({ scene, copiedSceneId, onCopy, onFork, onExpand, onCollapse 
   const canMutate = !scene.transient && !isEvicted;
 
   const typeConfig = {
-    user: { icon: <Icons.User />, color: 'text-emerald-400', bg: 'bg-emerald-400/10', border: 'border-emerald-400/20' },
-    assistant: { icon: <Icons.Bot />, color: 'text-blue-400', bg: 'bg-blue-400/10', border: 'border-blue-400/20' },
-    tool: { icon: <Icons.Terminal />, color: 'text-orange-400', bg: 'bg-orange-400/10', border: 'border-orange-400/20' },
-    system: { icon: <Icons.AlertCircle />, color: 'text-gray-400', bg: 'bg-gray-400/10', border: 'border-gray-400/20' },
+    user: { icon: <Icons.User />, color: 'text-[#fa520f]', bg: 'bg-[#ffe295]', border: 'border-[#ffa110]' },
+    assistant: { icon: <Icons.Bot />, color: 'text-[#fb6424]', bg: 'bg-[#ffd06a]', border: 'border-[#ffa110]' },
+    tool: { icon: <Icons.Terminal />, color: 'text-[#ff8105]', bg: 'bg-[#fff0c2]', border: 'border-[#ffa110]' },
+    system: { icon: <Icons.AlertCircle />, color: 'text-[#1f1f1f]', bg: 'bg-[#fff0c2]', border: 'border-[#ffa110]' },
   };
   const config = typeConfig[scene.type] || typeConfig.system;
 
   return (
-    <div className={`p-4 rounded-lg border transition-all duration-200 overflow-hidden min-w-0 ${isEvicted ? 'bg-[#0a0a0f] border-[#1a1a24] opacity-50' : 'bg-[#12121a] border-[#1e1e2e]'}`}>
+    <div className={`p-4 border transition-all duration-200 overflow-hidden min-w-0 ${isEvicted ? 'bg-[#fff0c2] border-[#ffd900] opacity-50' : 'bg-[#fffaeb] border-[#ffa110]'}`}>
       <div className="flex justify-between items-start mb-2 gap-3">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className={`flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${config.color} ${config.bg} border ${config.border}`}>
+          <span className={`flex items-center gap-1 px-2 py-0.5 text-xs font-medium ${config.color} ${config.bg} border ${config.border}`}>
             {config.icon}
             {scene.wid}
           </span>
-          <span className="text-xs text-gray-600 font-mono">{scene.type}</span>
-          {scene.transient && <span className="text-[10px] text-sky-300 border border-sky-300/30 px-1 py-0.5 rounded uppercase tracking-wider">Streaming</span>}
-          {isEvicted && <span className="text-[10px] text-red-400 border border-red-400/30 px-1 py-0.5 rounded uppercase tracking-wider">Evicted</span>}
+          <span className="text-xs text-[#1f1f1f] font-mono opacity-60">{scene.type}</span>
+          {scene.transient && <span className="text-[10px] text-[#1f1f1f] border border-[#ffa110] px-1 py-0.5 uppercase tracking-wider bg-[#ffd06a]">Streaming</span>}
+          {isEvicted && <span className="text-[10px] text-[#ffffff] border border-[#fa520f] px-1 py-0.5 uppercase tracking-wider bg-[#fa520f]">Evicted</span>}
           {isCompressed && <span className="compressed-badge">Compressed</span>}
         </div>
         <div className="flex items-center gap-2 flex-wrap justify-end">
-          <button onClick={() => onCopy(scene)} className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-200 transition-colors">
+          <button onClick={() => onCopy(scene)} className="flex items-center gap-1 text-xs text-[#1f1f1f] hover:text-[#fa520f] transition-colors opacity-60 hover:opacity-100">
             {copiedSceneId === scene.id ? <Icons.Check /> : <Icons.Copy />}
             {copiedSceneId === scene.id ? 'Copied' : 'Copy'}
           </button>
           {!scene.transient && (
-            <button onClick={() => onFork(scene.id)} className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300 transition-colors">
+            <button onClick={() => onFork(scene.id)} className="flex items-center gap-1 text-xs text-[#fb6424] hover:text-[#fa520f] transition-colors">
               <Icons.GitFork /> Fork
             </button>
           )}
           {canMutate && (
             isCompressed ? (
-              <button onClick={() => onExpand(scene.id)} className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors">
+              <button onClick={() => onExpand(scene.id)} className="flex items-center gap-1 text-xs text-[#1f1f1f] hover:text-[#fa520f] transition-colors opacity-60 hover:opacity-100">
                 <Icons.Maximize2 /> Expand
               </button>
             ) : (
-              <button onClick={() => onCollapse(scene.id)} className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 transition-colors">
+              <button onClick={() => onCollapse(scene.id)} className="flex items-center gap-1 text-xs text-[#1f1f1f] hover:text-[#fa520f] transition-colors opacity-60 hover:opacity-100">
                 <Icons.Minimize2 /> Collapse
               </button>
             )
@@ -616,9 +673,9 @@ const SceneCard = ({ scene, copiedSceneId, onCopy, onFork, onExpand, onCollapse 
         </div>
       </div>
 
-      <div className="text-xs font-mono text-gray-300 leading-relaxed overflow-x-hidden min-w-0">
+      <div className="text-xs font-mono text-[#1f1f1f] leading-relaxed overflow-x-hidden min-w-0">
         {isCompressed ? (
-          <div className="flex items-center gap-2 text-gray-500 italic">
+          <div className="flex items-center gap-2 text-[#1f1f1f] opacity-50 italic">
             <Icons.ChevronRight /> {scene.summary}
           </div>
         ) : (
@@ -636,18 +693,19 @@ const ContextMeter = ({ windowState }) => {
   const radius = 24;
   const circumference = 2 * Math.PI * radius;
   const dashOffset = circumference * (1 - utilization);
-  const toneClass = windowState.overThreshold ? 'text-rose-400' : utilization > 0.85 ? 'text-amber-300' : 'text-cyan-300';
+  const strokeClass = windowState.overThreshold ? 'stroke-[#fa520f]' : utilization > 0.85 ? 'stroke-[#fb6424]' : 'stroke-[#ff8a00]';
+  const textClass = windowState.overThreshold ? 'text-[#fa520f]' : utilization > 0.85 ? 'text-[#fb6424]' : 'text-[#ff8a00]';
   const percent = Math.round((windowState.utilization || 0) * 100);
 
   return (
-    <div className="flex items-center gap-2 text-xs text-slate-500" title={`${percent}% of compression threshold`}>
+    <div className="flex items-center gap-2 text-xs" title={`${percent}% of compression threshold`}>
       <div className="relative h-9 w-9">
         <svg className="-rotate-90 h-9 w-9" viewBox="0 0 64 64">
-          <circle cx="32" cy="32" r={radius} className="fill-none stroke-slate-700/55" strokeWidth="5" />
-          <circle cx="32" cy="32" r={radius} className={`fill-none ${toneClass}`} strokeWidth="5" strokeLinecap="round" strokeDasharray={circumference} strokeDashoffset={dashOffset} />
+          <circle cx="32" cy="32" r={radius} className="fill-none stroke-[#e5d5a8] stroke-[5]" />
+          <circle cx="32" cy="32" r={radius} className={`fill-none ${strokeClass} stroke-[5] stroke-linecap-round`} strokeDasharray={circumference} strokeDashoffset={dashOffset} />
         </svg>
       </div>
-      <div className={`text-sm font-medium ${toneClass}`}>
+      <div className={`text-sm font-medium ${textClass}`}>
         {formatCompactCount(renderedTokens)} / {formatCompactCount(threshold)}
       </div>
     </div>
@@ -724,7 +782,7 @@ function App() {
       const res = await fetch(`${API_BASE}/action`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ storyId: state?.activeStoryId, ...payload }),
       });
       const data = await res.json();
       if (data.logs) setMetaLogs((prev) => [...prev, ...data.logs]);
@@ -782,7 +840,7 @@ function App() {
       const res = await fetch(`${API_BASE}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input }),
+        body: JSON.stringify({ message: input, storyId: state.activeStoryId }),
       });
       setInput('');
       fetchState();
@@ -834,49 +892,49 @@ function App() {
   };
 
   if (!state) {
-    return <div className="h-screen bg-[#0a0a0f] flex items-center justify-center"><div className="text-cyan-400 font-mono text-sm animate-pulse">Connecting to backend...</div></div>;
+    return <div className="h-screen bg-[#fffaeb] flex items-center justify-center"><div className="text-[#fa520f] font-mono text-sm animate-pulse">Connecting to backend...</div></div>;
   }
 
   return (
     <>
-      <div className="flex h-screen w-full bg-[#0a0a0f] text-gray-100">
-        <div className="w-56 bg-[#12121a] border-r border-[#1e1e2e] flex flex-col">
-          <div className="p-4 border-b border-[#1e1e2e] flex items-center gap-2">
-            <div className="text-cyan-400"><Icons.Branch /></div>
-            <span className="text-xs font-semibold tracking-wider text-gray-300 uppercase">Stories</span>
+      <div className="flex h-screen w-full bg-[#fffaeb] text-[#1f1f1f]">
+        <div className="w-56 bg-[#fff0c2] border-r border-[#ffa110] flex flex-col">
+          <div className="p-4 border-b border-[#ffa110] flex items-center gap-2">
+            <div className="text-[#fa520f]"><Icons.Branch /></div>
+            <span className="text-xs font-semibold tracking-wider text-[#1f1f1f] uppercase">Stories</span>
           </div>
           <ul className="flex-1 overflow-y-auto p-2">
             {state.storyIds.map((id) => (
-              <li key={id} onClick={() => doAction({ action: 'switch_story', storyId: id })} className={`mb-1 px-3 py-2 rounded text-xs font-mono cursor-pointer transition-all duration-200 ${id === state.activeStoryId ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30' : 'text-gray-500 hover:text-gray-300 hover:bg-[#1a1a24]'}`}>
+              <li key={id} onClick={() => doAction({ action: 'switch_story', storyId: id })} className={`mb-1 px-3 py-2 rounded text-xs font-mono cursor-pointer transition-all duration-200 ${id === state.activeStoryId ? 'bg-[#ffd900]/20 text-[#fa520f] border border-[#ffa110]' : 'text-[#1f1f1f] hover:bg-[#ffe295] border border-transparent'}`}>
                 {id}
               </li>
             ))}
           </ul>
         </div>
 
-        <div className="flex-1 flex flex-col bg-[#0d0d14]">
-          <div className="p-4 border-b border-[#1e1e2e] flex justify-between items-center bg-[#12121a]">
+        <div className="flex-1 flex flex-col bg-[#fffaeb]">
+          <div className="p-4 border-b border-[#ffa110] flex justify-between items-center bg-[#fff0c2]">
             <div>
-              <h2 className="text-sm font-semibold text-gray-200 tracking-wide"><span className="text-cyan-400">›</span> {state.activeStoryId}</h2>
-              <div className="flex items-center gap-4 mt-1 text-xs text-gray-500 font-mono">
-                <span>window: <span className="text-cyan-400">{state.window.startIndex}</span></span>
-                <span>nodes: <span className="text-cyan-400">{state.path.length}</span></span>
+              <h2 className="text-sm font-semibold text-[#1f1f1f] tracking-wide"><span className="text-[#fa520f]">›</span> {state.activeStoryId}</h2>
+              <div className="flex items-center gap-4 mt-1 text-xs text-[#1f1f1f] font-mono opacity-60">
+                <span>window: <span className="text-[#fa520f]">{state.window.startIndex}</span></span>
+                <span>nodes: <span className="text-[#fa520f]">{state.path.length}</span></span>
               </div>
             </div>
             <div className="flex items-center gap-2">
               <ContextMeter windowState={state.window} />
-              <button onClick={() => setDebugOpen(true)} className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-sky-300 bg-sky-400/10 border border-sky-400/20 rounded hover:bg-sky-400/20 transition-all"><Icons.Eye /> Context</button>
-              <button onClick={() => doAction({ action: 'recycle', count: 1 })} className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-yellow-400 bg-yellow-400/10 border border-yellow-400/20 rounded hover:bg-yellow-400/20 transition-all"><Icons.Refresh /> Recycle</button>
-              <button onClick={() => doAction({ action: 'meta_compress' })} className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-purple-400 bg-purple-400/10 border border-purple-400/20 rounded hover:bg-purple-400/20 transition-all"><Icons.Zap /> Compress</button>
+              <button onClick={() => setDebugOpen(true)} className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#1f1f1f] bg-[#ffe295] border border-[#ffa110] hover:bg-[#ffd900] transition-all"><Icons.Eye /> Context</button>
+              <button onClick={() => doAction({ action: 'recycle', count: 1 })} className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#1f1f1f] bg-[#ffd900] border border-[#ffa110] hover:bg-[#ffb83e] transition-all"><Icons.Refresh /> Recycle</button>
+              <button onClick={() => doAction({ action: 'meta_compress' })} className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#ffffff] bg-[#fa520f] border border-[#fb6424] hover:bg-[#fb6424] transition-all"><Icons.Zap /> Compress</button>
             </div>
           </div>
 
-          <div className="p-3 border-b border-[#1e1e2e] bg-[#0f0f18]">
-            <div className="flex items-center gap-2 text-xs font-medium text-gray-500 mb-2 uppercase tracking-wider">
-              <div className="text-cyan-400"><Icons.Eye /></div>
+          <div className="p-3 border-b border-[#ffa110] bg-[#fff0c2]">
+            <div className="flex items-center gap-2 text-xs font-medium text-[#1f1f1f] mb-2 uppercase tracking-wider opacity-60">
+              <div className="text-[#fa520f]"><Icons.Eye /></div>
               Context Summary
             </div>
-            <textarea className="w-full text-xs p-2 rounded bg-[#1a1a24] border border-[#2a2a3a] text-gray-300 font-mono focus:outline-none focus:border-cyan-500/50 transition-colors" rows="2" defaultValue={state.window.historySummary} onBlur={(e) => doAction({ action: 'edit_history', summary: e.target.value })} placeholder="Evicted context summary..." />
+            <textarea className="w-full text-xs p-2 rounded bg-[#fffaeb] border border-[#ffa110] text-[#1f1f1f] font-mono focus:outline-none focus:border-[#fa520f] transition-colors" rows="2" defaultValue={state.window.historySummary} onBlur={(e) => doAction({ action: 'edit_history', summary: e.target.value })} placeholder="Evicted context summary..." />
           </div>
 
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
@@ -901,10 +959,10 @@ function App() {
             <div ref={endRef} />
           </div>
 
-          <div className="p-4 bg-[#12121a] border-t border-[#1e1e2e]">
+          <div className="p-4 bg-[#fff0c2] border-t border-[#ffa110]">
             <div className="flex gap-2">
-              <input type="text" className="flex-1 bg-[#1a1a24] border border-[#2a2a3a] rounded px-4 py-2 text-sm text-gray-200 font-mono focus:outline-none focus:border-cyan-500/50 transition-colors placeholder-gray-600" placeholder="Enter command or instruction..." value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && doChat()} disabled={loading} />
-              <button onClick={doChat} disabled={loading} className={`px-4 py-2 rounded font-medium text-sm transition-all flex items-center gap-2 ${loading ? 'bg-cyan-500/20 text-cyan-400/50 cursor-not-allowed' : 'bg-cyan-500 text-[#0a0a0f] hover:bg-cyan-400'}`}>
+              <input type="text" className="flex-1 bg-[#fffaeb] border border-[#ffa110] rounded px-4 py-2 text-sm text-[#1f1f1f] font-mono focus:outline-none focus:border-[#fa520f] transition-colors placeholder-[#1f1f1f] opacity-50" placeholder="Enter command or instruction..." value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && doChat()} disabled={loading} />
+              <button onClick={doChat} disabled={loading} className={`px-4 py-2 rounded font-medium text-sm transition-all flex items-center gap-2 ${loading ? 'bg-[#ffe295] text-[#1f1f1f]/50 cursor-not-allowed' : 'bg-[#1f1f1f] text-[#ffffff] hover:bg-[#fa520f]'}`}>
                 <Icons.Send />
                 {loading ? 'Running...' : 'Send'}
               </button>
@@ -912,16 +970,16 @@ function App() {
           </div>
         </div>
 
-        <div className="w-72 bg-[#12121a] border-l border-[#1e1e2e] flex flex-col">
-          <div className="p-4 border-b border-[#1e1e2e] flex items-center gap-2">
-            <div className="text-purple-400"><Icons.Eye /></div>
-            <span className="text-xs font-semibold tracking-wider text-gray-300 uppercase">Meta-Agent</span>
+        <div className="w-72 bg-[#fff0c2] border-l border-[#ffa110] flex flex-col">
+          <div className="p-4 border-b border-[#ffa110] flex items-center gap-2">
+            <div className="text-[#fa520f]"><Icons.Eye /></div>
+            <span className="text-xs font-semibold tracking-wider text-[#1f1f1f] uppercase">Meta-Agent</span>
           </div>
-          <div className="flex-1 overflow-y-auto p-3 bg-[#0a0a0f] font-mono text-xs">
+          <div className="flex-1 overflow-y-auto p-3 bg-[#fffaeb] font-mono text-xs">
             {metaLogs.map((log, index) => (
-              <div key={`${index}-${log}`} className="mb-3 pb-3 border-b border-[#1a1a24] last:border-0">
-                <div className="text-gray-600 text-[10px] mb-1">{new Date().toLocaleTimeString()}</div>
-                <div className="text-gray-400 leading-relaxed">{log}</div>
+              <div key={`${index}-${log}`} className="mb-3 pb-3 border-b border-[#ffe295] last:border-0">
+                <div className="text-[#1f1f1f] text-[10px] mb-1 opacity-50">{new Date().toLocaleTimeString()}</div>
+                <div className="text-[#1f1f1f] leading-relaxed opacity-80">{log}</div>
               </div>
             ))}
           </div>

@@ -170,6 +170,7 @@ class ContextWindow {
 
     render(graph: StoryGraph): string {
         const fullPath = graph.resolvePath(this.activeStory.headSceneId);
+        normalizeWindowStartIndex(this, fullPath);
         const visibleScenes = fullPath.slice(this.windowStartIndex);
         let prompt = "";
         if (this.historySummary) prompt += `[GLOBAL HISTORY SUMMARY]\n${this.historySummary}\n\n====================\n\n`;
@@ -184,6 +185,32 @@ class ContextWindow {
             }).join('\n\n---\n\n');
         return prompt;
     }
+}
+
+function normalizeWindowStartIndex(window: ContextWindow, fullPath?: Scene[]): number {
+    const resolvedPath = fullPath ?? graph.resolvePath(window.activeStory.headSceneId);
+    if (resolvedPath.length === 0) {
+        window.windowStartIndex = 0;
+        return 0;
+    }
+
+    const lastVisibleSceneIndex = (() => {
+        for (let index = resolvedPath.length - 1; index >= 0; index--) {
+            if (resolvedPath[index]?.type !== 'sentinel') return index;
+        }
+        return 0;
+    })();
+
+    window.windowStartIndex = clamp(window.windowStartIndex, 0, lastVisibleSceneIndex);
+
+    while (
+        window.windowStartIndex < lastVisibleSceneIndex
+        && resolvedPath[window.windowStartIndex]?.type === 'sentinel'
+    ) {
+        window.windowStartIndex += 1;
+    }
+
+    return window.windowStartIndex;
 }
 
 // ==========================================
@@ -879,19 +906,25 @@ function appendHistorySummary(window: ContextWindow, scenes: Scene[]): void {
 
 function recycleOldestScenes(window: ContextWindow, count: number): number {
     const fullPath = graph.resolvePath(window.activeStory.headSceneId);
+    normalizeWindowStartIndex(window, fullPath);
+    let cursor = window.windowStartIndex;
     let nextIndex = window.windowStartIndex;
     let remaining = Math.max(0, count);
     const scenesToRecycle: Scene[] = [];
 
-    while (nextIndex < fullPath.length && remaining > 0) {
-        const scene = fullPath[nextIndex++];
+    while (cursor < fullPath.length && remaining > 0) {
+        const scene = fullPath[cursor++];
         if (scene.type === 'sentinel') continue;
         scenesToRecycle.push(scene);
         remaining--;
+        nextIndex = cursor;
     }
 
     appendHistorySummary(window, scenesToRecycle);
-    window.windowStartIndex = nextIndex;
+    if (scenesToRecycle.length > 0) {
+        window.windowStartIndex = nextIndex;
+        normalizeWindowStartIndex(window, fullPath);
+    }
     return scenesToRecycle.length;
 }
 
@@ -1056,6 +1089,7 @@ function appendData(storyId: string, type: NodeType, content: string, summary?: 
     // 3. 推进上下文
     story.headSceneId = newSentinelId;
     window.updateStory(story);
+    normalizeWindowStartIndex(window);
     
     // 强制触发一次 getOrAssignState 为新节点分配 WID
     window.getOrAssignState(entityId);
@@ -1074,6 +1108,7 @@ app.get('/api/state', async (_req: Request, res: Response) => {
     const story = stories.get(activeStoryId)!;
     const window = windows.get(activeStoryId)!;
     const fullPath = graph.resolvePath(story.headSceneId);
+    normalizeWindowStartIndex(window, fullPath);
     const renderedContext = window.render(graph);
     const runtimeConfig = await getRuntimeModelConfig();
     const systemPrompt = buildAgentSystemPrompt(runtimeConfig);
@@ -1119,14 +1154,17 @@ app.get('/api/state', async (_req: Request, res: Response) => {
 // 主 Agent 对话接口
 app.post('/api/chat', async (req: Request, res: Response) => {
     const message = typeof req.body?.message === 'string' ? req.body.message : '';
+    const requestStoryId = typeof req.body?.storyId === 'string' && stories.has(req.body.storyId)
+        ? req.body.storyId
+        : activeStoryId;
     const traceId = createTraceId();
-    if (message) appendData(activeStoryId, 'user', message);
+    if (message) appendData(requestStoryId, 'user', message);
 
-    const window = windows.get(activeStoryId)!;
+    const window = windows.get(requestStoryId)!;
     logChat(
         traceId,
         'request:start',
-        `story=${activeStoryId} messageLength=${message.length} preview=${JSON.stringify(previewText(message))}`,
+        `story=${requestStoryId} messageLength=${message.length} preview=${JSON.stringify(previewText(message))}`,
     );
 
     res.writeHead(200, {
@@ -1157,7 +1195,7 @@ app.post('/api/chat', async (req: Request, res: Response) => {
                 'compression:triggered',
                 `pass=${pass + 1} estimatedPromptTokens=${estimateAgentInputTokens(window, runtimeConfig)}`,
             );
-            const compression = await runMetaCompression(activeStoryId, runtimeConfig, traceId);
+            const compression = await runMetaCompression(requestStoryId, runtimeConfig, traceId);
             autoCompressionLogs.push(...compression.logs);
             if (!compression.applied) break;
 
@@ -1613,19 +1651,19 @@ ${stderr}` : ''}`.trim();
         logChat(traceId, 'steps:resolved', `count=${steps.length}`);
 
         for (const log of autoCompressionLogs) {
-            appendData(activeStoryId, 'system', `[自动压缩] ${log}`);
+            appendData(requestStoryId, 'system', `[自动压缩] ${log}`);
         }
 
         // 提取并在架构中重构中间步骤
         for (const step of steps) {
             if (step.text.trim()) {
-                appendData(activeStoryId, 'assistant', step.text);
+                appendData(requestStoryId, 'assistant', step.text);
             }
 
             for (const toolCall of step.toolCalls) {
                 const toolInput = (toolCall as any).args ?? (toolCall as any).input;
                 appendData(
-                    activeStoryId,
+                    requestStoryId,
                     'assistant',
                     `[调用工具] ${toolCall.toolName}: ${JSON.stringify(toolInput)}`,
                     `调用工具 ${toolCall.toolName}`,
@@ -1642,7 +1680,7 @@ ${stderr}` : ''}`.trim();
             for (const toolResult of step.toolResults) {
                 const toolOutput = (toolResult as any).result ?? (toolResult as any).output ?? toolResult;
                 appendData(
-                    activeStoryId,
+                    requestStoryId,
                     'tool',
                     JSON.stringify(toolOutput),
                     `工具 ${toolResult.toolName} 返回结果`,
@@ -1663,7 +1701,7 @@ ${stderr}` : ''}`.trim();
             'result:text',
             `length=${finalResultText.length} preview=${JSON.stringify(previewText(finalResultText))}`,
         );
-        if (steps.length === 0 && finalResultText.trim()) appendData(activeStoryId, 'assistant', finalResultText);
+        if (steps.length === 0 && finalResultText.trim()) appendData(requestStoryId, 'assistant', finalResultText);
         
         res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
         res.end();
@@ -1680,7 +1718,10 @@ ${stderr}` : ''}`.trim();
 // 手动操作/工具接口
 app.post('/api/action', async (req: Request, res: Response) => {
     const { action, sceneId, count, summary } = req.body;
-    const window = windows.get(activeStoryId)!;
+    const requestStoryId = typeof req.body?.storyId === 'string' && stories.has(req.body.storyId)
+        ? req.body.storyId
+        : activeStoryId;
+    const window = windows.get(requestStoryId)!;
 
     if (action === 'switch_story') {
         const storyId = typeof req.body?.storyId === 'string' ? req.body.storyId : '';
@@ -1711,7 +1752,7 @@ app.post('/api/action', async (req: Request, res: Response) => {
         if (state) state.mode = DisplayMode.EXPANDED;
     }
     else if (action === 'meta_compress') {
-        const logs = (await runMetaCompression(activeStoryId, undefined, createTraceId())).logs;
+        const logs = (await runMetaCompression(requestStoryId, undefined, createTraceId())).logs;
         res.json({ success: true, logs });
         return;
     }
@@ -1722,7 +1763,7 @@ app.post('/api/action', async (req: Request, res: Response) => {
         }
         const newStoryId = `fork_${Date.now()}`;
         const targetSceneId = sceneId;
-        const sourceStory = stories.get(activeStoryId)!;
+        const sourceStory = stories.get(requestStoryId)!;
         
         stories.set(newStoryId, { headSceneId: targetSceneId });
         const newWindow = new ContextWindow(stories.get(newStoryId)!);
