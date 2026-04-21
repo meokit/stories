@@ -241,10 +241,13 @@ const MarkdownContent = ({ content }) => (
       remarkPlugins={[remarkGfm]}
       components={{
         code({ inline, className, children, ...props }) {
-          if (inline) {
+          const codeContent = String(children);
+          const isMultiLine = codeContent.includes('\n');
+          
+          if (inline || !isMultiLine) {
             return (
               <code className={className} {...props}>
-                {children}
+                {isMultiLine ? codeContent.replace(/\n/g, ' ') : children}
               </code>
             );
           }
@@ -346,6 +349,60 @@ const SceneContent = ({ scene }) => {
   }
 
   return <MarkdownContent content={trimmedContent} />;
+};
+
+function formatCompactCount(value) {
+  const abs = Math.abs(value);
+  if (abs >= 1000 * 1000) {
+    const scaled = value / (1000 * 1000);
+    return `${scaled >= 100 ? scaled.toFixed(0) : scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(2)}M`;
+  }
+
+  if (abs >= 1000) {
+    const scaled = value / 1000;
+    return `${scaled >= 100 ? scaled.toFixed(0) : scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(2)}K`;
+  }
+
+  return String(value);
+}
+
+const ContextMeter = ({ windowState }) => {
+  const threshold = windowState.compressionThreshold || 1;
+  const renderedTokens = windowState.contextTokenCount || 0;
+  const utilization = Math.max(0, Math.min(windowState.utilization || 0, 1));
+  const radius = 24;
+  const circumference = 2 * Math.PI * radius;
+  const dashOffset = circumference * (1 - utilization);
+  const toneClass = windowState.overThreshold
+    ? 'text-rose-400'
+    : utilization > 0.85
+      ? 'text-amber-300'
+      : 'text-cyan-300';
+  const percent = Math.round((windowState.utilization || 0) * 100);
+  const tooltip = `${percent}% of compression threshold`;
+
+  return (
+    <div className="flex items-center gap-2 text-xs text-slate-500" title={tooltip}>
+      <div className="relative h-9 w-9">
+        <svg className="-rotate-90 h-9 w-9" viewBox="0 0 64 64">
+          <circle cx="32" cy="32" r={radius} className="fill-none stroke-slate-700/55" strokeWidth="5" />
+          <circle
+            cx="32"
+            cy="32"
+            r={radius}
+            className={`fill-none ${toneClass}`}
+            strokeWidth="5"
+            strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={dashOffset}
+          />
+        </svg>
+      </div>
+      <div className={`text-sm font-medium ${toneClass}`}>
+        {formatCompactCount(renderedTokens)} / {formatCompactCount(threshold)}
+      </div>
+    </div>
+  );
 };
 
 function App() {
@@ -546,6 +603,13 @@ function App() {
   }
 
   const scenes = [...state.path, ...streamScenes];
+  const debugContextText = [
+    '[SYSTEM PROMPT]',
+    state.window.systemPrompt || '',
+    '',
+    '========== RENDERED CONTEXT ==========', 
+    state.window.renderedContext || '',
+  ].join('\n');
 
   return (
     <>
@@ -584,6 +648,7 @@ function App() {
               </div>
             </div>
             <div className="flex items-center gap-2">
+              <ContextMeter windowState={state.window} />
               <button
                 onClick={() => setDebugOpen(true)}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-sky-300 bg-sky-400/10 border border-sky-400/20 rounded hover:bg-sky-400/20 transition-all"
@@ -763,11 +828,11 @@ function App() {
             <div className="app-modal-header">
               <div>
                 <div className="app-modal-title">Rendered Context</div>
-                <div className="app-modal-subtitle">Raw output from `ContextWindow.render(graph)`</div>
+                <div className="app-modal-subtitle">System prompt plus raw output from `ContextWindow.render(graph)`</div>
               </div>
               <div className="app-modal-actions">
                 <button
-                  onClick={() => copyScene({ id: 'context-debug', content: state.window.renderedContext || '' })}
+                  onClick={() => copyScene({ id: 'context-debug', content: debugContextText })}
                   className="app-modal-button"
                 >
                   <Icons.Copy /> Copy
@@ -777,7 +842,7 @@ function App() {
                 </button>
               </div>
             </div>
-            <pre className="app-modal-content">{state.window.renderedContext || ''}</pre>
+            <pre className="app-modal-content">{debugContextText}</pre>
           </div>
         </div>
       )}
